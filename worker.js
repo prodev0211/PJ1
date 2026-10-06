@@ -33,7 +33,8 @@ const plain = (msg, status) =>
 
 /** Cách 1: tikwm. Tự thử lại một lần nếu bị giới hạn tốc độ. */
 async function viaTikwm(url, trace) {
-  for (let attempt = 0; attempt < 2; attempt++) {
+  const ATTEMPTS = 3;
+  for (let attempt = 0; attempt < ATTEMPTS; attempt++) {
     const res = await fetch(TIKWM + "/api/", {
       method: "POST",
       headers: {
@@ -72,8 +73,8 @@ async function viaTikwm(url, trace) {
       };
     }
 
-    if (attempt === 0 && /limit|second/i.test(String(payload.msg || ""))) {
-      await sleep(1200);
+    if (attempt < ATTEMPTS - 1 && /limit|second/i.test(String(payload.msg || ""))) {
+      await sleep(1200 * (attempt + 1));
       continue;
     }
     trace.push("tikwm: " + (payload.msg || "mã " + payload.code));
@@ -346,13 +347,13 @@ footer strong { color: var(--text); font: 800 1rem var(--display); }
 const BODY = `
 <div class="wrap">
   <header class="top">
-    <a class="brand" href="/" aria-label="DevDownload - trang chủ">
+    <a class="brand" href="/" aria-label="Tải Sạch - trang chủ">
       <svg width="32" height="32" viewBox="0 0 32 32" aria-hidden="true">
         <defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#ff4f79"/><stop offset="1" stop-color="#8b5cf6"/></linearGradient></defs>
         <rect width="32" height="32" rx="9" fill="url(#g)"/>
         <path d="M16 8v11m0 0-5-5m5 5 5-5M9 24h14" stroke="#fff" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
       </svg>
-      <span>Dev Download</span>
+      <span>Tải Sạch</span>
     </a>
     <nav class="nav" aria-label="Điều hướng"><a href="#cach-dung">Cách dùng</a><a href="#hoi-dap">Hỏi đáp</a></nav>
   </header>
@@ -409,7 +410,7 @@ const BODY = `
   </main>
 
   <footer>
-    <p><strong>Dev Download</strong></p>
+    <p><strong>Tải Sạch</strong></p>
     <p>Công cụ độc lập, không liên kết với TikTok. Máy chủ không lưu video, file được chuyển thẳng tới thiết bị.</p>
   </footer>
 </div>
@@ -418,6 +419,7 @@ const BODY = `
 // Lưu ý: script phía trình duyệt không dùng dấu backtick hay ${...} vì nằm trong String.raw.
 const SCRIPT = String.raw`
 const MAX = 5;
+const START_GAP = 400; // ms giữa hai video bắt đầu lấy
 const TIKTOK = /^https?:\/\/(?:[a-z0-9-]+\.)*tiktok\.com\//i;
 const LINK_RE = /https?:\/\/(?:[a-z0-9-]+\.)*tiktok\.com\/[^\s]+/gi;
 const $ = (id) => document.getElementById(id);
@@ -675,11 +677,18 @@ async function run() {
   updateHead();
   results.scrollIntoView({ behavior: "smooth", block: "nearest" });
 
-  for (let i = 0; i < items.length; i++) {
-    setBusy(true, items.length > 1 ? "Đang lấy video " + (i + 1) + "/" + items.length : "Đang lấy video");
-    await loadItem(items[i]);
-    if (i < items.length - 1) await sleep(1100); // tikwm giới hạn khoảng 1 yêu cầu mỗi giây
-  }
+  // Chạy song song. Mỗi video xuất phát lệch nhau một nhịp ngắn vì tikwm giới hạn tốc độ.
+  let done = 0;
+  const label = () => (items.length > 1 ? "Đang lấy video " + done + "/" + items.length : "Đang lấy video");
+  setBusy(true, label());
+  await Promise.all(
+    items.map(async (it, i) => {
+      await sleep(i * START_GAP);
+      await loadItem(it);
+      done++;
+      goLabel.textContent = label();
+    })
+  );
   setBusy(false);
 
   const ok = items.filter((i) => i.state === "ready").length;
@@ -764,7 +773,7 @@ const PAGE = `<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>DevDownload - Download Video Tiktok không chứa watermark</title>
+<title>Tải Sạch - Tải video TikTok không watermark</title>
 <meta name="description" content="Dán link, nhận file MP4 không logo TikTok ở chất lượng cao nhất. Tải tối đa 5 video cùng lúc, miễn phí, không cần đăng ký.">
 <meta name="theme-color" content="#0b1020">
 <link rel="icon" href="${FAVICON}">
