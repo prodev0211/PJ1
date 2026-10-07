@@ -181,10 +181,71 @@ async function handleDownload(searchParams) {
   }
 }
 
+/* ============================== Quảng cáo (Cloudflare KV) ============================== */
+
+const ADS_KEY = "ads";
+const MAX_ADS = 30;
+
+const html = (body) =>
+  new Response(body, { headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" } });
+
+const readAds = async (env) => (env.ADS ? (await env.ADS.get(ADS_KEY, "json")) || [] : []);
+
+const isHttps = (u) => {
+  try {
+    return new URL(u).protocol === "https:";
+  } catch {
+    return false;
+  }
+};
+
+/** Chỉ giữ trường hợp lệ và cắt độ dài; trả về null nếu dữ liệu sai. */
+function cleanAds(list) {
+  if (!Array.isArray(list) || list.length > MAX_ADS) return null;
+  const ads = [];
+  for (const a of list) {
+    const ad = {
+      id: String(a.id || crypto.randomUUID()).slice(0, 40),
+      title: String(a.title || "").trim().slice(0, 120),
+      image: String(a.image || "").trim(),
+      url: String(a.url || "").trim(),
+      active: a.active !== false,
+    };
+    if (!ad.title || !isHttps(ad.url) || (ad.image && !isHttps(ad.image))) return null;
+    ads.push(ad);
+  }
+  return ads;
+}
+
+function isAdmin(request, env) {
+  if (!env.ADMIN_PASSWORD) return false;
+  const enc = new TextEncoder();
+  const given = enc.encode((request.headers.get("Authorization") || "").replace(/^Bearer /, ""));
+  const secret = enc.encode(env.ADMIN_PASSWORD);
+  return given.byteLength === secret.byteLength && crypto.subtle.timingSafeEqual(given, secret);
+}
+
+/** Công khai: chỉ các quảng cáo đang bật. */
+async function handleAds(env) {
+  return json((await readAds(env)).filter((a) => a.active));
+}
+
+/** Quản trị: GET lấy toàn bộ danh sách, PUT ghi đè danh sách mới. */
+async function handleAdminAds(request, env) {
+  if (!isAdmin(request, env)) return json({ error: "Sai mật khẩu." }, 401);
+  if (!env.ADS) return json({ error: "Chưa gắn KV namespace tên ADS cho Worker." }, 500);
+  if (request.method === "GET") return json(await readAds(env));
+
+  const ads = cleanAds(await request.json().catch(() => null));
+  if (!ads) return json({ error: "Dữ liệu không hợp lệ: cần tiêu đề, link https, tối đa " + MAX_ADS + " quảng cáo." }, 400);
+  await env.ADS.put(ADS_KEY, JSON.stringify(ads));
+  return json(ads);
+}
+
 /* ============================== Router ============================== */
 
 export default {
-  async fetch(request) {
+  async fetch(request, env) {
     try {
       const { pathname, searchParams } = new URL(request.url);
       const { method } = request;
@@ -194,6 +255,9 @@ export default {
       }
       if (method === "POST" && pathname === "/api/info") return await handleInfo(request);
       if (method === "GET" && pathname === "/api/download") return await handleDownload(searchParams);
+      if (method === "GET" && pathname === "/api/ads") return await handleAds(env);
+      if (method === "GET" && pathname === "/admin") return html(ADMIN_PAGE);
+      if (pathname === "/api/admin/ads" && (method === "GET" || method === "PUT")) return await handleAdminAds(request, env);
 
       return plain("Không tìm thấy trang.", 404);
     } catch {
@@ -320,6 +384,14 @@ h1 { margin: 0 auto; max-width: 14ch; font: 800 clamp(2.4rem, 9vw, 4.2rem)/1.03 
 .clip.ready .edge { animation: sweep .9s cubic-bezier(.7,0,.2,1) .5s both; }
 @keyframes sweep { 0% { left: 0; opacity: 1; } 92% { opacity: 1; } 100% { left: 100%; opacity: 0; } }
 
+/* Quảng cáo */
+.tag { margin-left: 8px; padding: 2px 10px; font: 500 .75rem var(--body); letter-spacing: 0; color: var(--muted); background: var(--surface-2); border-radius: 999px; vertical-align: middle; }
+.ads { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 12px; }
+.ad { display: flex; flex-direction: column; overflow: hidden; text-decoration: none; background: var(--surface); border: 1px solid var(--line); border-radius: 18px; }
+.ad:hover { background: var(--surface-2); }
+.ad img { width: 100%; aspect-ratio: 1; object-fit: cover; background: var(--bg-2); }
+.ad span { padding: 10px 12px 12px; font-size: .9rem; font-weight: 500; line-height: 1.35; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+
 /* Các mục bên dưới */
 .block { padding: 56px 0; border-top: 1px solid var(--line); }
 .block h2 { margin: 0 0 24px; font: 800 clamp(1.5rem, 5vw, 2rem)/1.15 var(--display); letter-spacing: -.025em; }
@@ -390,6 +462,11 @@ const BODY = `
       </ul>
     </section>
 
+    <section id="ads" class="block" hidden aria-labelledby="h-ads">
+      <h2 id="h-ads">Gợi ý cho bạn<span class="tag">Quảng cáo</span></h2>
+      <div id="adList" class="ads"></div>
+    </section>
+
     <section id="cach-dung" class="block" aria-labelledby="h-cach-dung">
       <h2 id="h-cach-dung">Cách dùng</h2>
       <ol class="steps">
@@ -420,6 +497,7 @@ const BODY = `
 const SCRIPT = String.raw`
 const MAX = 5;
 const START_GAP = 400; // ms giữa hai video bắt đầu lấy
+const IN_APP = /TaiSachApp/.test(navigator.userAgent); // đang chạy trong ứng dụng Android
 const TIKTOK = /^https?:\/\/(?:[a-z0-9-]+\.)*tiktok\.com\//i;
 const LINK_RE = /https?:\/\/(?:[a-z0-9-]+\.)*tiktok\.com\/[^\s]+/gi;
 const $ = (id) => document.getElementById(id);
@@ -701,6 +779,11 @@ async function saveItem(it, quiet) {
   const info = it.info;
   if (!info) return false;
   const src = info.kind === "worker" ? "/api/download?url=" + encodeURIComponent(it.url) : info.src;
+  if (IN_APP) { // WebView: giao cho DownloadManager của Android xử lý
+    el("a", { href: src, download: "" }).click();
+    setState(it, "ready", "Đang tải về, xem thông báo của Android.", "ok");
+    return true;
+  }
   it.dlBtn.disabled = true;
   setState(it, "ready", "Đang tải video...");
   try {
@@ -732,12 +815,10 @@ async function downloadAll() {
   if (!ready.length) return;
   dlBusy = true;
   dlAll.disabled = true;
-  let ok = 0;
-  for (let i = 0; i < ready.length; i++) {
-    dlAll.textContent = "Đang tải " + (i + 1) + "/" + ready.length;
-    if (await saveItem(ready[i], true)) ok++;
-    await sleep(900);
-  }
+  dlAll.textContent = "Đang tải " + ready.length + " video";
+  // Tải đồng thời; lệch nhau 200 ms để trình duyệt không bỏ sót file nào.
+  const results = await Promise.all(ready.map(async (it, i) => { await sleep(i * 200); return saveItem(it, true); }));
+  const ok = results.filter(Boolean).length;
   dlBusy = false;
   dlAll.disabled = false;
   updateHead();
@@ -755,11 +836,27 @@ function resetAll() {
   window.scrollTo({ top: 0, behavior: "smooth" });
 }
 
+/* ---------- Quảng cáo ---------- */
+async function loadAds() {
+  try {
+    const ads = await (await fetch("/api/ads")).json();
+    if (!Array.isArray(ads) || !ads.length) return;
+    ads.sort(() => Math.random() - 0.5).slice(0, 6).forEach((ad) => {
+      const a = el("a", { className: "ad", href: ad.url, target: "_blank", rel: "sponsored nofollow noopener noreferrer" });
+      if (ad.image) a.append(el("img", { src: ad.image, alt: "", loading: "lazy", referrerPolicy: "no-referrer" }));
+      a.append(el("span", { textContent: ad.title }));
+      $("adList").append(a);
+    });
+    $("ads").hidden = false;
+  } catch (e) {}
+}
+
 goBtn.addEventListener("click", run);
 addBtn.addEventListener("click", () => { const r = addRow("", rowsEl.lastElementChild); if (r) inputOf(r).focus(); });
 dlAll.addEventListener("click", downloadAll);
 clearAll.addEventListener("click", resetAll);
 addRow("");
+loadAds();
 `;
 
 const FAVICON =
@@ -785,5 +882,125 @@ const PAGE = `<!doctype html>
 <body>
 ${BODY}
 <script>${SCRIPT}</script>
+</body>
+</html>`;
+
+/* ============================== Trang quản trị ============================== */
+
+const ADMIN_SCRIPT = String.raw`
+const $ = (id) => document.getElementById(id);
+let token = sessionStorage.getItem("tk") || "", ads = [];
+
+const say = (m, kind) => { $("msg").textContent = m || ""; $("msg").className = "status" + (kind ? " " + kind : ""); };
+
+function el(tag, props, kids) {
+  const node = Object.assign(document.createElement(tag), props || {});
+  (kids || []).forEach((k) => node.append(k));
+  return node;
+}
+
+async function api(method, body) {
+  const r = await fetch("/api/admin/ads", {
+    method: method,
+    headers: { Authorization: "Bearer " + token, "Content-Type": "application/json" },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || "Lỗi " + r.status);
+  return data;
+}
+
+async function enter() {
+  try {
+    ads = await api("GET");
+    sessionStorage.setItem("tk", token);
+    $("login").hidden = true;
+    $("app").hidden = false;
+    say("");
+    render();
+  } catch (e) {
+    sessionStorage.removeItem("tk");
+    $("login").hidden = false;
+    $("app").hidden = true;
+    say(e.message, "err");
+  }
+}
+
+async function save(next, okMsg) {
+  try { ads = await api("PUT", next); render(); say(okMsg, "ok"); return true; }
+  catch (e) { say(e.message, "err"); return false; }
+}
+
+function render() {
+  const list = $("list");
+  $("n").textContent = "(" + ads.length + ")";
+  list.textContent = "";
+  if (!ads.length) list.append(el("p", { className: "status", textContent: "Chưa có quảng cáo nào." }));
+  ads.forEach((ad, i) => {
+    const thumb = ad.image ? el("img", { src: ad.image, alt: "", referrerPolicy: "no-referrer" }) : el("div", { className: "ph" });
+    const info = el("div", {}, [el("h3", { textContent: ad.title }), el("p", { textContent: ad.url })]);
+    const toggle = el("button", { type: "button", className: "btn ghost sm", textContent: ad.active ? "Tạm ẩn" : "Hiện lại",
+      onclick: () => save(ads.map((a, j) => (j === i ? Object.assign({}, a, { active: !a.active }) : a)), "Đã cập nhật.") });
+    const remove = el("button", { type: "button", className: "btn ghost sm", textContent: "Xóa",
+      onclick: () => confirm("Xóa quảng cáo này?") && save(ads.filter((_, j) => j !== i), "Đã xóa.") });
+    list.append(el("div", { className: "ad-row" + (ad.active ? "" : " off") }, [thumb, info, el("div", { className: "i-actions" }, [toggle, remove])]));
+  });
+}
+
+$("loginBtn").onclick = () => { token = $("pw").value; enter(); };
+$("pw").addEventListener("keydown", (e) => { if (e.key === "Enter") $("loginBtn").click(); });
+$("addBtn").onclick = async () => {
+  const ad = { title: $("f-title").value.trim(), url: $("f-url").value.trim(), image: $("f-image").value.trim(), active: true };
+  if (!ad.title || !ad.url) return say("Cần nhập tiêu đề và link.", "err");
+  if (await save(ads.concat(ad), "Đã thêm quảng cáo.")) ["f-title", "f-url", "f-image"].forEach((id) => ($(id).value = ""));
+};
+if (token) enter();
+`;
+
+const ADMIN_PAGE = `<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<title>Quản trị quảng cáo - Tải Sạch</title>
+<link rel="icon" href="${FAVICON}">
+<style>${STYLE}
+.panel { margin-top: 20px; padding: 18px; background: var(--surface); border: 1px solid var(--line); border-radius: 20px; }
+.panel h2 { margin: 0 0 14px; font: 800 1.2rem var(--display); }
+.field { display: block; margin-bottom: 12px; font-size: .9rem; color: var(--muted); }
+.field input { width: 100%; height: 46px; margin-top: 6px; padding: 0 14px; border: 1px solid var(--line); border-radius: 12px; background: rgba(0,0,0,.25); outline: none; font-size: 16px; }
+.field input:focus { border-color: var(--accent); }
+.ad-row { display: grid; grid-template-columns: 56px 1fr; gap: 12px; align-items: center; padding: 12px 0; border-top: 1px solid var(--line); }
+.ad-row img, .ad-row .ph { width: 56px; height: 56px; border-radius: 10px; object-fit: cover; background: var(--bg-2); }
+.ad-row h3 { margin: 0; font-size: .95rem; word-break: break-word; }
+.ad-row p { margin: 0; font-size: .8rem; color: var(--muted); word-break: break-all; }
+.ad-row .i-actions { grid-column: 1 / -1; margin: 0; }
+.ad-row.off { opacity: .5; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header class="top"><a class="brand" href="/">Tải Sạch</a><span class="nav"><a href="/">Về trang chủ</a></span></header>
+  <main>
+    <section id="login" class="panel">
+      <h2>Đăng nhập quản trị</h2>
+      <label class="field">Mật khẩu<input id="pw" type="password" autocomplete="current-password"></label>
+      <button id="loginBtn" class="btn primary" type="button">Đăng nhập</button>
+    </section>
+    <section id="app" hidden>
+      <div class="panel">
+        <h2>Thêm quảng cáo</h2>
+        <label class="field">Tiêu đề<input id="f-title" maxlength="120" placeholder="Ví dụ: Giá đỡ điện thoại giảm 30%"></label>
+        <label class="field">Link Shopee affiliate<input id="f-url" type="url" inputmode="url" placeholder="https://s.shopee.vn/..."></label>
+        <label class="field">Link ảnh (không bắt buộc)<input id="f-image" type="url" inputmode="url" placeholder="https://..."></label>
+        <button id="addBtn" class="btn primary" type="button">Thêm</button>
+      </div>
+      <div class="panel"><h2>Danh sách <span id="n"></span></h2><div id="list"></div></div>
+    </section>
+    <div id="msg" class="status" role="status" aria-live="polite"></div>
+  </main>
+</div>
+<script>${ADMIN_SCRIPT}</script>
 </body>
 </html>`;
