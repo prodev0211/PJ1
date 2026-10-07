@@ -185,6 +185,9 @@ async function handleDownload(searchParams) {
 
 const ADS_KEY = "ads";
 const MAX_ADS = 30;
+const MAX_IMAGE = 1.5 * 1024 * 1024; // byte; ảnh đã được thu nhỏ ở trình duyệt nên thường dưới 200 KB
+const IMAGE_TYPES = ["image/jpeg", "image/png", "image/webp"];
+const LOCAL_IMG = /^\/img\/[0-9a-f]{32}$/; // ảnh lưu trong KV, phát qua /img/<id>
 
 const html = (body) =>
   new Response(body, { headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" } });
@@ -211,7 +214,7 @@ function cleanAds(list) {
       url: String(a.url || "").trim(),
       active: a.active !== false,
     };
-    if (!ad.title || !isHttps(ad.url) || (ad.image && !isHttps(ad.image))) return null;
+    if (!ad.title || !isHttps(ad.url) || (ad.image && !isHttps(ad.image) && !LOCAL_IMG.test(ad.image))) return null;
     ads.push(ad);
   }
   return ads;
@@ -238,8 +241,42 @@ async function handleAdminAds(request, env) {
 
   const ads = cleanAds(await request.json().catch(() => null));
   if (!ads) return json({ error: "Dữ liệu không hợp lệ: cần tiêu đề, link https, tối đa " + MAX_ADS + " quảng cáo." }, 400);
+  const previous = await readAds(env);
   await env.ADS.put(ADS_KEY, JSON.stringify(ads));
+
+  // Dọn ảnh tải lên mà không quảng cáo nào còn dùng
+  const used = new Set(ads.map((a) => a.image));
+  const orphans = previous.filter((a) => LOCAL_IMG.test(a.image) && !used.has(a.image));
+  await Promise.all(orphans.map((a) => env.ADS.delete("img:" + a.image.slice(5))));
   return json(ads);
+}
+
+/** Quản trị: nhận ảnh (đã thu nhỏ ở trình duyệt), lưu vào KV, trả về đường dẫn /img/<id>. */
+async function handleUpload(request, env) {
+  if (!isAdmin(request, env)) return json({ error: "Sai mật khẩu." }, 401);
+  if (!env.ADS) return json({ error: "Chưa gắn KV namespace tên ADS cho Worker." }, 500);
+
+  const type = (request.headers.get("Content-Type") || "").split(";")[0];
+  if (!IMAGE_TYPES.includes(type)) return json({ error: "Chỉ nhận ảnh JPG, PNG hoặc WebP." }, 415);
+  const data = await request.arrayBuffer();
+  if (!data.byteLength || data.byteLength > MAX_IMAGE) return json({ error: "Ảnh quá lớn (tối đa 1,5 MB)." }, 413);
+
+  const id = crypto.randomUUID().replaceAll("-", "");
+  await env.ADS.put("img:" + id, data, { metadata: { type } });
+  return json({ url: "/img/" + id });
+}
+
+/** Công khai: phát ảnh đã tải lên. */
+async function handleImage(pathname, env) {
+  const { value, metadata } = env.ADS ? await env.ADS.getWithMetadata("img:" + pathname.slice(5), "arrayBuffer") : {};
+  if (!value) return plain("Không tìm thấy ảnh.", 404);
+  return new Response(value, {
+    headers: {
+      "Content-Type": metadata?.type || "image/jpeg",
+      "Cache-Control": "public, max-age=31536000, immutable",
+      "X-Content-Type-Options": "nosniff",
+    },
+  });
 }
 
 /* ============================== Router ============================== */
@@ -257,6 +294,8 @@ export default {
       if (method === "GET" && pathname === "/api/download") return await handleDownload(searchParams);
       if (method === "GET" && pathname === "/api/ads") return await handleAds(env);
       if (method === "GET" && pathname === "/admin") return html(ADMIN_PAGE);
+      if (method === "PUT" && pathname === "/api/admin/upload") return await handleUpload(request, env);
+      if (method === "GET" && LOCAL_IMG.test(pathname)) return await handleImage(pathname, env);
       if (pathname === "/api/admin/ads" && (method === "GET" || method === "PUT")) return await handleAdminAds(request, env);
 
       return plain("Không tìm thấy trang.", 404);
@@ -384,13 +423,18 @@ h1 { margin: 0 auto; max-width: 14ch; font: 800 clamp(2.4rem, 9vw, 4.2rem)/1.03 
 .clip.ready .edge { animation: sweep .9s cubic-bezier(.7,0,.2,1) .5s both; }
 @keyframes sweep { 0% { left: 0; opacity: 1; } 92% { opacity: 1; } 100% { left: 100%; opacity: 0; } }
 
-/* Quảng cáo */
+/* Quảng cáo: một thẻ, hai vị trí (hàng cuộn ngang dưới kết quả, lưới ở giữa trang) */
 .tag { margin-left: 8px; padding: 2px 10px; font: 500 .75rem var(--body); letter-spacing: 0; color: var(--muted); background: var(--surface-2); border-radius: 999px; vertical-align: middle; }
-.ads { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 12px; }
-.ad { display: flex; flex-direction: column; overflow: hidden; text-decoration: none; background: var(--surface); border: 1px solid var(--line); border-radius: 18px; }
-.ad:hover { background: var(--surface-2); }
-.ad img { width: 100%; aspect-ratio: 1; object-fit: cover; background: var(--bg-2); }
-.ad span { padding: 10px 12px 12px; font-size: .9rem; font-weight: 500; line-height: 1.35; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.ads { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 12px; }
+.ads.row { display: flex; overflow-x: auto; scroll-snap-type: x mandatory; padding-bottom: 6px; scrollbar-width: thin; }
+.ads.row .ad { flex: 0 0 150px; scroll-snap-align: start; }
+.ad { display: flex; flex-direction: column; overflow: hidden; text-decoration: none; background: var(--surface); border: 1px solid var(--line); border-radius: 18px; transition: transform .15s, background .15s; }
+.ad:hover { background: var(--surface-2); transform: translateY(-2px); }
+.ad img, .ad .ph { width: 100%; aspect-ratio: 1; object-fit: cover; background: var(--bg-2); }
+.ad span { padding: 10px 12px 0; font-size: .9rem; font-weight: 500; line-height: 1.35; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.ad small { padding: 4px 12px 12px; color: var(--accent); font-size: .82rem; font-weight: 600; }
+.promo { margin-top: 18px; padding: 14px; background: var(--surface); border: 1px dashed var(--line); border-radius: 20px; }
+.promo-label { margin: 0 0 10px; color: var(--muted); font-size: .8rem; letter-spacing: .04em; text-transform: uppercase; }
 
 /* Các mục bên dưới */
 .block { padding: 56px 0; border-top: 1px solid var(--line); }
@@ -453,6 +497,10 @@ const BODY = `
           </div>
         </div>
         <div id="list" class="list"></div>
+        <aside id="adsResult" class="promo" hidden aria-label="Quảng cáo">
+          <p class="promo-label">Quảng cáo</p>
+          <div id="adRow" class="ads row"></div>
+        </aside>
       </div>
 
       <ul class="perks">
@@ -507,7 +555,7 @@ const rowsEl = $("rows"), addBtn = $("add"), countEl = $("count");
 const goBtn = $("go"), goLabel = $("goLabel"), spin = $("spin"), statusEl = $("status");
 const results = $("results"), listEl = $("list"), resCount = $("resCount"), dlAll = $("dlAll"), clearAll = $("clearAll");
 
-let busy = false, dlBusy = false, items = [];
+let busy = false, dlBusy = false, hasAds = false, items = [];
 
 const SVG_PASTE = '<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="8" y="3" width="8" height="4" rx="1"/><path d="M16 5h2a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h2"/></svg>';
 const SVG_CLOSE = '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M6 6l12 12M18 6 6 18"/></svg>';
@@ -736,6 +784,7 @@ function resetResults() {
   items = [];
   listEl.textContent = "";
   results.hidden = true;
+  $("adsResult").hidden = true;
 }
 
 async function run() {
@@ -770,6 +819,7 @@ async function run() {
   setBusy(false);
 
   const ok = items.filter((i) => i.state === "ready").length;
+  $("adsResult").hidden = !(ok && hasAds);
   if (ok === items.length) say(ok > 1 ? "Đã sẵn sàng " + ok + " video." : "Video đã sẵn sàng.", "ok");
   else say("Sẵn sàng " + ok + "/" + items.length + " video. Với video lỗi, bấm Thử lại.", ok ? "" : "err");
 }
@@ -837,17 +887,24 @@ function resetAll() {
 }
 
 /* ---------- Quảng cáo ---------- */
+// Hai vị trí: (1) dưới kết quả, hiện khi video đã sẵn sàng, lúc người dùng đang chú ý; (2) mục giữa trang, không chắn form.
+function adCard(ad) {
+  const a = el("a", { className: "ad", href: ad.url, target: "_blank", rel: "sponsored nofollow noopener noreferrer" });
+  a.append(ad.image ? el("img", { src: ad.image, alt: "", loading: "lazy", referrerPolicy: "no-referrer" }) : el("div", { className: "ph" }));
+  a.append(el("span", { textContent: ad.title }), el("small", { textContent: "Xem ngay" }));
+  return a;
+}
+
 async function loadAds() {
   try {
-    const ads = await (await fetch("/api/ads")).json();
-    if (!Array.isArray(ads) || !ads.length) return;
-    ads.sort(() => Math.random() - 0.5).slice(0, 6).forEach((ad) => {
-      const a = el("a", { className: "ad", href: ad.url, target: "_blank", rel: "sponsored nofollow noopener noreferrer" });
-      if (ad.image) a.append(el("img", { src: ad.image, alt: "", loading: "lazy", referrerPolicy: "no-referrer" }));
-      a.append(el("span", { textContent: ad.title }));
-      $("adList").append(a);
-    });
+    const pool = await (await fetch("/api/ads")).json();
+    if (!Array.isArray(pool) || !pool.length) return;
+    const mixed = pool.slice().sort(() => Math.random() - 0.5);
+    const rest = mixed.length > 4 ? mixed.slice(4, 10) : mixed; // ít quảng cáo thì dùng lại cho đủ chỗ
+    mixed.slice(0, 4).forEach((ad) => $("adRow").append(adCard(ad)));
+    rest.forEach((ad) => $("adList").append(adCard(ad)));
     $("ads").hidden = false;
+    hasAds = true;
   } catch (e) {}
 }
 
@@ -888,72 +945,189 @@ ${BODY}
 /* ============================== Trang quản trị ============================== */
 
 const ADMIN_SCRIPT = String.raw`
-const $ = (id) => document.getElementById(id);
-let token = sessionStorage.getItem("tk") || "", ads = [];
-
-const say = (m, kind) => { $("msg").textContent = m || ""; $("msg").className = "status" + (kind ? " " + kind : ""); };
+const $ = (s) => document.querySelector(s);
+const LOCAL = /^\/img\/[0-9a-f]{32}$/;
+const HINT_UP = "Chọn ảnh từ máy hoặc kéo thả vào đây";
+let token = sessionStorage.getItem("tk") || "", ads = [], editing = -1, pendingImage = "";
 
 function el(tag, props, kids) {
   const node = Object.assign(document.createElement(tag), props || {});
   (kids || []).forEach((k) => node.append(k));
   return node;
 }
+const host = (u) => { try { return new URL(u).hostname.replace(/^www\./, ""); } catch (e) { return u; } };
 
-async function api(method, body) {
-  const r = await fetch("/api/admin/ads", {
-    method: method,
-    headers: { Authorization: "Bearer " + token, "Content-Type": "application/json" },
-    body: body ? JSON.stringify(body) : undefined,
-  });
+function toast(msg, kind) {
+  const t = $("#toast");
+  t.textContent = msg;
+  t.className = "toast show " + (kind || "");
+  clearTimeout(toast.timer);
+  toast.timer = setTimeout(() => { t.className = "toast"; }, 3200);
+}
+
+async function call(path, opts) {
+  const o = opts || {};
+  const r = await fetch(path, Object.assign({}, o, { headers: Object.assign({ Authorization: "Bearer " + token }, o.headers) }));
   const data = await r.json().catch(() => ({}));
   if (!r.ok) throw new Error(data.error || "Lỗi " + r.status);
   return data;
 }
 
+/* ---------- Đăng nhập ---------- */
+function show(loggedIn) {
+  $("#login").hidden = loggedIn;
+  $("#app").hidden = !loggedIn;
+  $("#logout").hidden = !loggedIn;
+}
+
 async function enter() {
   try {
-    ads = await api("GET");
+    ads = await call("/api/admin/ads");
     sessionStorage.setItem("tk", token);
-    $("login").hidden = true;
-    $("app").hidden = false;
-    say("");
+    $("#loginErr").textContent = "";
+    show(true);
     render();
   } catch (e) {
     sessionStorage.removeItem("tk");
-    $("login").hidden = false;
-    $("app").hidden = true;
-    say(e.message, "err");
+    show(false);
+    if (token) $("#loginErr").textContent = e.message;
   }
 }
 
-async function save(next, okMsg) {
-  try { ads = await api("PUT", next); render(); say(okMsg, "ok"); return true; }
-  catch (e) { say(e.message, "err"); return false; }
+/* ---------- Danh sách ---------- */
+async function persist(next, msg) {
+  try {
+    ads = await call("/api/admin/ads", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(next) });
+    render();
+    toast(msg, "ok");
+    return true;
+  } catch (e) {
+    toast(e.message, "err");
+    return false;
+  }
+}
+
+function btn(text, title, onclick, disabled, cls) {
+  return el("button", { type: "button", className: "btn ghost sm " + (cls || ""), textContent: text, title: title, disabled: !!disabled, onclick: onclick });
+}
+
+function card(ad, i) {
+  const swap = (d) => { const n = ads.slice(), j = i + d; [n[i], n[j]] = [n[j], n[i]]; persist(n, "Đã đổi thứ tự."); };
+  const toggle = el("button", {
+    type: "button", className: "switch", title: ad.active ? "Đang hiện. Bấm để ẩn" : "Đang ẩn. Bấm để hiện",
+    onclick: () => persist(ads.map((a, j) => (j === i ? Object.assign({}, a, { active: !a.active }) : a)), ad.active ? "Đã ẩn quảng cáo." : "Đã bật quảng cáo."),
+  });
+  toggle.setAttribute("role", "switch");
+  toggle.setAttribute("aria-checked", String(ad.active));
+
+  const thumb = ad.image ? el("img", { src: ad.image, alt: "", referrerPolicy: "no-referrer" }) : el("div", { className: "ph", textContent: "Không ảnh" });
+  const meta = el("div", { className: "meta" }, [
+    el("h3", { textContent: ad.title }),
+    el("a", { href: ad.url, target: "_blank", rel: "noopener noreferrer", textContent: host(ad.url) }),
+    el("span", { className: "badge " + (ad.active ? "on" : "off"), textContent: ad.active ? "Đang hiện" : "Đang ẩn" }),
+  ]);
+  const tools = el("div", { className: "tools" }, [
+    btn("↑", "Đưa lên", () => swap(-1), i === 0),
+    btn("↓", "Đưa xuống", () => swap(1), i === ads.length - 1),
+    btn("Sửa", "Sửa quảng cáo", () => openForm(i)),
+    btn("Xóa", "Xóa quảng cáo", () => confirm("Xóa quảng cáo này?") && persist(ads.filter((_, j) => j !== i), "Đã xóa quảng cáo."), false, "danger"),
+  ]);
+  return el("article", { className: "ad-card" + (ad.active ? "" : " dim") }, [thumb, meta, toggle, tools]);
 }
 
 function render() {
-  const list = $("list");
-  $("n").textContent = "(" + ads.length + ")";
+  const on = ads.filter((a) => a.active).length;
+  $("#sTotal").textContent = ads.length;
+  $("#sOn").textContent = on;
+  $("#sOff").textContent = ads.length - on;
+  const list = $("#list");
   list.textContent = "";
-  if (!ads.length) list.append(el("p", { className: "status", textContent: "Chưa có quảng cáo nào." }));
-  ads.forEach((ad, i) => {
-    const thumb = ad.image ? el("img", { src: ad.image, alt: "", referrerPolicy: "no-referrer" }) : el("div", { className: "ph" });
-    const info = el("div", {}, [el("h3", { textContent: ad.title }), el("p", { textContent: ad.url })]);
-    const toggle = el("button", { type: "button", className: "btn ghost sm", textContent: ad.active ? "Tạm ẩn" : "Hiện lại",
-      onclick: () => save(ads.map((a, j) => (j === i ? Object.assign({}, a, { active: !a.active }) : a)), "Đã cập nhật.") });
-    const remove = el("button", { type: "button", className: "btn ghost sm", textContent: "Xóa",
-      onclick: () => confirm("Xóa quảng cáo này?") && save(ads.filter((_, j) => j !== i), "Đã xóa.") });
-    list.append(el("div", { className: "ad-row" + (ad.active ? "" : " off") }, [thumb, info, el("div", { className: "i-actions" }, [toggle, remove])]));
-  });
+  ads.forEach((ad, i) => list.append(card(ad, i)));
+  $("#empty").hidden = ads.length > 0;
 }
 
-$("loginBtn").onclick = () => { token = $("pw").value; enter(); };
-$("pw").addEventListener("keydown", (e) => { if (e.key === "Enter") $("loginBtn").click(); });
-$("addBtn").onclick = async () => {
-  const ad = { title: $("f-title").value.trim(), url: $("f-url").value.trim(), image: $("f-image").value.trim(), active: true };
-  if (!ad.title || !ad.url) return say("Cần nhập tiêu đề và link.", "err");
-  if (await save(ads.concat(ad), "Đã thêm quảng cáo.")) ["f-title", "f-url", "f-image"].forEach((id) => ($(id).value = ""));
-};
+/* ---------- Form thêm / sửa ---------- */
+function setMode(mode) {
+  document.querySelectorAll(".seg button").forEach((b) => b.classList.toggle("on", b.dataset.mode === mode));
+  $("#paneUp").hidden = mode !== "up";
+  $("#paneUrl").hidden = mode !== "url";
+}
+
+function preview(src) {
+  const box = $("#pv");
+  box.textContent = "";
+  if (src) box.append(el("img", { src: src, alt: "Ảnh xem trước", referrerPolicy: "no-referrer" }));
+  box.hidden = !src;
+}
+
+function openForm(i) {
+  editing = i;
+  const ad = i >= 0 ? ads[i] : { title: "", url: "", image: "" };
+  pendingImage = ad.image || "";
+  const local = LOCAL.test(pendingImage);
+  $("#dlgTitle").textContent = i >= 0 ? "Sửa quảng cáo" : "Thêm quảng cáo";
+  $("#fTitle").value = ad.title;
+  $("#fUrl").value = ad.url;
+  $("#fImage").value = local ? "" : pendingImage;
+  $("#dropText").textContent = local ? "Đã có ảnh. Chọn ảnh khác để thay." : HINT_UP;
+  setMode(pendingImage && !local ? "url" : "up");
+  preview(pendingImage);
+  $("#dlg").showModal();
+}
+
+// Thu nhỏ về tối đa 800px rồi nén JPEG: file nhẹ, tải lên nhanh, trang chủ không bị chậm.
+async function shrink(file) {
+  const bmp = await createImageBitmap(file);
+  const k = Math.min(1, 800 / Math.max(bmp.width, bmp.height));
+  const c = el("canvas", { width: Math.round(bmp.width * k), height: Math.round(bmp.height * k) });
+  const g = c.getContext("2d");
+  g.fillStyle = "#fff";
+  g.fillRect(0, 0, c.width, c.height);
+  g.drawImage(bmp, 0, 0, c.width, c.height);
+  return new Promise((ok, no) => c.toBlob((b) => (b ? ok(b) : no(new Error("Không xử lý được ảnh."))), "image/jpeg", 0.85));
+}
+
+async function upload(file) {
+  if (!file || !file.type.startsWith("image/")) return toast("Hãy chọn một file ảnh.", "err");
+  $("#dropText").textContent = "Đang tải ảnh lên...";
+  try {
+    const r = await call("/api/admin/upload", { method: "PUT", headers: { "Content-Type": "image/jpeg" }, body: await shrink(file) });
+    pendingImage = r.url;
+    preview(r.url);
+    $("#dropText").textContent = "Đã tải lên. Chọn ảnh khác để thay.";
+  } catch (e) {
+    $("#dropText").textContent = HINT_UP;
+    toast(e.message, "err");
+  }
+}
+
+async function submitForm() {
+  const urlMode = $(".seg .on").dataset.mode === "url";
+  const ad = { title: $("#fTitle").value.trim(), url: $("#fUrl").value.trim(), image: urlMode ? $("#fImage").value.trim() : pendingImage };
+  if (!ad.title) return toast("Hãy nhập tiêu đề.", "err");
+  if (!/^https:\/\//i.test(ad.url)) return toast("Link Shopee phải bắt đầu bằng https://", "err");
+  if (ad.image && !/^https:\/\//i.test(ad.image) && !LOCAL.test(ad.image)) return toast("Link ảnh phải bắt đầu bằng https://", "err");
+
+  const next = editing >= 0
+    ? ads.map((a, j) => (j === editing ? Object.assign({}, a, ad) : a))
+    : ads.concat(Object.assign({ active: true }, ad));
+  if (await persist(next, editing >= 0 ? "Đã lưu thay đổi." : "Đã thêm quảng cáo.")) $("#dlg").close();
+}
+
+/* ---------- Sự kiện ---------- */
+$("#loginBtn").onclick = () => { token = $("#pw").value; enter(); };
+$("#pw").addEventListener("keydown", (e) => { if (e.key === "Enter") $("#loginBtn").click(); });
+$("#logout").onclick = () => { sessionStorage.removeItem("tk"); token = ""; $("#pw").value = ""; show(false); };
+$("#addBtn").onclick = () => { if (ads.length >= 30) toast("Đã đạt tối đa 30 quảng cáo.", "err"); else openForm(-1); };
+$("#cancelBtn").onclick = () => $("#dlg").close();
+$("#saveBtn").onclick = submitForm;
+document.querySelectorAll(".seg button").forEach((b) => (b.onclick = () => setMode(b.dataset.mode)));
+$("#fFile").onchange = (e) => { upload(e.target.files[0]); e.target.value = ""; };
+$("#fImage").oninput = (e) => preview(/^https:\/\//i.test(e.target.value.trim()) ? e.target.value.trim() : "");
+const drop = $("#drop");
+["dragover", "dragenter"].forEach((n) => drop.addEventListener(n, (e) => { e.preventDefault(); drop.classList.add("over"); }));
+["dragleave", "drop"].forEach((n) => drop.addEventListener(n, () => drop.classList.remove("over")));
+drop.addEventListener("drop", (e) => { e.preventDefault(); upload(e.dataTransfer.files[0]); });
 if (token) enter();
 `;
 
@@ -963,44 +1137,115 @@ const ADMIN_PAGE = `<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex,nofollow">
+<meta name="theme-color" content="#0b1020">
 <title>Quản trị quảng cáo - Tải Sạch</title>
 <link rel="icon" href="${FAVICON}">
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,600;12..96,800&family=Be+Vietnam+Pro:wght@400;500;600&display=swap" rel="stylesheet">
 <style>${STYLE}
-.panel { margin-top: 20px; padding: 18px; background: var(--surface); border: 1px solid var(--line); border-radius: 20px; }
-.panel h2 { margin: 0 0 14px; font: 800 1.2rem var(--display); }
-.field { display: block; margin-bottom: 12px; font-size: .9rem; color: var(--muted); }
-.field input { width: 100%; height: 46px; margin-top: 6px; padding: 0 14px; border: 1px solid var(--line); border-radius: 12px; background: rgba(0,0,0,.25); outline: none; font-size: 16px; }
+.shell { max-width: 960px; margin: 0 auto; padding: 0 20px; }
+.bar { position: sticky; top: 0; z-index: 5; background: rgba(11,16,32,.82); backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px); border-bottom: 1px solid var(--line); }
+.bar-in { display: flex; align-items: center; justify-content: space-between; height: 62px; }
+.bar-r { display: flex; align-items: center; gap: 10px; }
+.bar-r a { color: var(--muted); font-size: .9rem; text-decoration: none; }
+.bar-r a:hover { color: var(--text); }
+.login { max-width: 400px; margin: 72px auto; padding: 28px; background: var(--surface); border: 1px solid var(--line); border-radius: 24px; }
+.login h1 { margin: 0 0 6px; font: 800 1.6rem var(--display); }
+.login p { margin: 0 0 18px; color: var(--muted); }
+.login .btn { width: 100%; }
+.err { min-height: 1.4em; margin: 0 0 10px !important; color: var(--err) !important; font-size: .9rem; }
+.field { display: block; margin-bottom: 14px; font-size: .9rem; font-weight: 500; color: var(--muted); }
+.field input[type=text], .field input[type=url], .field input[type=password], .field input:not([type]) { display: block; width: 100%; height: 48px; margin-top: 6px; padding: 0 14px; color: var(--text); border: 1px solid var(--line); border-radius: 12px; background: rgba(0,0,0,.25); outline: none; font-size: 16px; }
 .field input:focus { border-color: var(--accent); }
-.ad-row { display: grid; grid-template-columns: 56px 1fr; gap: 12px; align-items: center; padding: 12px 0; border-top: 1px solid var(--line); }
-.ad-row img, .ad-row .ph { width: 56px; height: 56px; border-radius: 10px; object-fit: cover; background: var(--bg-2); }
-.ad-row h3 { margin: 0; font-size: .95rem; word-break: break-word; }
-.ad-row p { margin: 0; font-size: .8rem; color: var(--muted); word-break: break-all; }
-.ad-row .i-actions { grid-column: 1 / -1; margin: 0; }
-.ad-row.off { opacity: .5; }
+.stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin: 24px 0; }
+.stat { padding: 16px 18px; background: var(--surface); border: 1px solid var(--line); border-radius: 18px; }
+.stat b { display: block; font: 800 1.9rem/1.1 var(--display); }
+.stat span { color: var(--muted); font-size: .85rem; }
+.head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.head h2 { margin: 0; font: 800 1.3rem var(--display); }
+.note { margin: 6px 0 16px; color: var(--muted); font-size: .88rem; }
+.ad-list { display: grid; gap: 12px; }
+.ad-card { display: grid; grid-template-columns: 72px 1fr auto; gap: 14px; align-items: center; padding: 12px; background: var(--surface); border: 1px solid var(--line); border-radius: 18px; }
+.ad-card img, .ad-card .ph { width: 72px; height: 72px; border-radius: 12px; object-fit: cover; background: var(--bg-2); }
+.ad-card .ph { display: grid; place-items: center; color: var(--muted); font-size: .7rem; text-align: center; }
+.ad-card.dim img, .ad-card.dim .meta h3 { opacity: .5; }
+.meta { min-width: 0; display: grid; gap: 2px; justify-items: start; }
+.meta h3 { margin: 0; font-size: 1rem; line-height: 1.35; word-break: break-word; }
+.meta a { color: var(--muted); font-size: .82rem; text-decoration: none; }
+.meta a:hover { text-decoration: underline; }
+.badge { margin-top: 2px; padding: 1px 10px; border-radius: 999px; font-size: .75rem; font-weight: 600; }
+.badge.on { color: var(--ok); background: rgba(61,220,151,.12); }
+.badge.off { color: var(--muted); background: var(--surface-2); }
+.switch { position: relative; width: 46px; height: 28px; border: 0; border-radius: 999px; background: var(--surface-2); cursor: pointer; transition: background .2s; }
+.switch::after { content: ""; position: absolute; top: 3px; left: 3px; width: 22px; height: 22px; border-radius: 50%; background: #fff; transition: transform .2s; }
+.switch[aria-checked=true] { background: var(--ok); }
+.switch[aria-checked=true]::after { transform: translateX(18px); }
+.tools { grid-column: 1 / -1; display: flex; gap: 8px; justify-content: flex-end; padding-top: 10px; border-top: 1px solid var(--line); }
+.btn.danger { color: var(--err); }
+.empty { padding: 48px 20px; text-align: center; color: var(--muted); border: 1px dashed var(--line); border-radius: 20px; }
+dialog { width: min(520px, calc(100vw - 24px)); max-height: calc(100vh - 24px); padding: 0; color: var(--text); background: #141a38; border: 1px solid var(--line); border-radius: 24px; }
+dialog::backdrop { background: rgba(5,8,20,.72); backdrop-filter: blur(4px); }
+.dlg { padding: 22px; }
+.dlg h2 { margin: 0 0 18px; font: 800 1.3rem var(--display); }
+.seg { display: flex; gap: 4px; margin: 6px 0 10px; padding: 4px; background: rgba(0,0,0,.25); border-radius: 12px; }
+.seg button { flex: 1; height: 38px; border: 0; border-radius: 9px; background: none; color: var(--muted); font-weight: 600; cursor: pointer; }
+.seg button.on { background: var(--surface-2); color: var(--text); }
+.drop { display: grid; place-items: center; min-height: 92px; padding: 14px; text-align: center; color: var(--muted); border: 1.5px dashed var(--line); border-radius: 14px; cursor: pointer; }
+.drop:hover, .drop.over { border-color: var(--accent); color: var(--text); }
+.pv { margin-top: 12px; }
+.pv img { display: block; width: 120px; height: 120px; object-fit: cover; border-radius: 14px; border: 1px solid var(--line); }
+.dlg-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 18px; }
+.toast { position: fixed; left: 50%; bottom: 24px; z-index: 20; padding: 12px 18px; max-width: calc(100vw - 32px); border-radius: 14px; background: #1d2447; border: 1px solid var(--line); opacity: 0; transform: translate(-50%, 12px); pointer-events: none; transition: .25s; }
+.toast.show { opacity: 1; transform: translate(-50%, 0); }
+.toast.ok { border-color: var(--ok); }
+.toast.err { border-color: var(--err); }
+@media (min-width: 720px) {
+  .ad-card { grid-template-columns: 72px 1fr auto auto; }
+  .tools { grid-column: auto; padding: 0; border: 0; }
+}
 </style>
 </head>
 <body>
-<div class="wrap">
-  <header class="top"><a class="brand" href="/">Tải Sạch</a><span class="nav"><a href="/">Về trang chủ</a></span></header>
-  <main>
-    <section id="login" class="panel">
-      <h2>Đăng nhập quản trị</h2>
-      <label class="field">Mật khẩu<input id="pw" type="password" autocomplete="current-password"></label>
-      <button id="loginBtn" class="btn primary" type="button">Đăng nhập</button>
-    </section>
-    <section id="app" hidden>
-      <div class="panel">
-        <h2>Thêm quảng cáo</h2>
-        <label class="field">Tiêu đề<input id="f-title" maxlength="120" placeholder="Ví dụ: Giá đỡ điện thoại giảm 30%"></label>
-        <label class="field">Link Shopee affiliate<input id="f-url" type="url" inputmode="url" placeholder="https://s.shopee.vn/..."></label>
-        <label class="field">Link ảnh (không bắt buộc)<input id="f-image" type="url" inputmode="url" placeholder="https://..."></label>
-        <button id="addBtn" class="btn primary" type="button">Thêm</button>
-      </div>
-      <div class="panel"><h2>Danh sách <span id="n"></span></h2><div id="list"></div></div>
-    </section>
-    <div id="msg" class="status" role="status" aria-live="polite"></div>
-  </main>
-</div>
+<header class="bar"><div class="shell bar-in">
+  <a class="brand" href="/admin">Tải Sạch<span class="tag">Quản trị</span></a>
+  <div class="bar-r"><a href="/" target="_blank" rel="noopener">Xem trang chủ</a><button id="logout" class="btn ghost sm" type="button" hidden>Đăng xuất</button></div>
+</div></header>
+
+<main class="shell">
+  <section id="login" class="login">
+    <h1>Đăng nhập</h1>
+    <p>Nhập mật khẩu quản trị để quản lý quảng cáo.</p>
+    <label class="field">Mật khẩu<input id="pw" type="password" autocomplete="current-password"></label>
+    <p id="loginErr" class="err" role="alert"></p>
+    <button id="loginBtn" class="btn primary" type="button">Đăng nhập</button>
+  </section>
+
+  <section id="app" hidden>
+    <div class="stats">
+      <div class="stat"><b id="sTotal">0</b><span>Tổng số</span></div>
+      <div class="stat"><b id="sOn">0</b><span>Đang hiện</span></div>
+      <div class="stat"><b id="sOff">0</b><span>Đang ẩn</span></div>
+    </div>
+    <div class="head"><h2>Quảng cáo</h2><button id="addBtn" class="btn primary sm" type="button">+ Thêm quảng cáo</button></div>
+    <p class="note">Trang chủ hiển thị ngẫu nhiên các quảng cáo đang hiện, ở hai vị trí: dưới kết quả tải và mục "Gợi ý cho bạn". Thay đổi có hiệu lực ngay.</p>
+    <div id="list" class="ad-list"></div>
+    <div id="empty" class="empty" hidden>Chưa có quảng cáo nào. Bấm "Thêm quảng cáo" để bắt đầu.</div>
+  </section>
+</main>
+
+<dialog id="dlg" aria-labelledby="dlgTitle"><div class="dlg">
+  <h2 id="dlgTitle"></h2>
+  <label class="field">Tiêu đề<input id="fTitle" type="text" maxlength="120" placeholder="Ví dụ: Giá đỡ điện thoại giảm 30%"></label>
+  <label class="field">Link Shopee affiliate<input id="fUrl" type="url" inputmode="url" placeholder="https://s.shopee.vn/..."></label>
+  <div class="field">Ảnh (không bắt buộc)
+    <div class="seg"><button type="button" data-mode="up" class="on">Tải từ máy</button><button type="button" data-mode="url">Dán link</button></div>
+    <div id="paneUp"><label id="drop" class="drop"><input id="fFile" type="file" accept="image/*" hidden><span id="dropText"></span></label></div>
+    <div id="paneUrl" hidden><input id="fImage" type="url" inputmode="url" placeholder="https://..."></div>
+    <div id="pv" class="pv" hidden></div>
+  </div>
+  <div class="dlg-actions"><button id="cancelBtn" class="btn ghost sm" type="button">Hủy</button><button id="saveBtn" class="btn primary sm" type="button">Lưu</button></div>
+</div></dialog>
+
+<div id="toast" class="toast" role="status" aria-live="polite"></div>
 <script>${ADMIN_SCRIPT}</script>
 </body>
 </html>`;
