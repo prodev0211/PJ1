@@ -4,3 +4,5 @@ compatibility_date = "2025-01-01"
 [[kv_namespaces]]
 binding = "ADS"
 id = "061bb7dd83964f83a8528325038edb51"
+[vars]
+ADMIN_PASSWORD = "huyentrang22012003"
